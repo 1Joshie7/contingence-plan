@@ -7,7 +7,12 @@ class Assignment(models.Model):
     created_by = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name='assignments')
     created_at = models.DateTimeField(auto_now_add=True)
     deadline = models.DateTimeField()
-    
+    # Optional fields for static analysis (can be stored in grading_config)
+    required_function_name = models.CharField(max_length=100, blank=True, null=True)
+    required_param_count = models.IntegerField(blank=True, null=True)
+    # New field: JSON config for grading
+    grading_config = models.JSONField(default=dict, blank=True)
+
     def __str__(self):
         return self.title
 
