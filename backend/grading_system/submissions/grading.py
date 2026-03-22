@@ -3,6 +3,7 @@ import tempfile
 import os
 import ast
 import re
+from google import genai
 from django.core.files.storage import default_storage
 
 # ============================================================
@@ -33,6 +34,7 @@ def run_code_tests(code_file, test_cases):
         code_content = default_storage.open(code_file.name).read().decode('utf-8')
         f.write(code_content)
         temp_path = f.name
+
     try:
         for test_case in test_cases:
             try:
@@ -50,6 +52,7 @@ def run_code_tests(code_file, test_cases):
                     'input': test_case.input_data,
                     'expected': test_case.expected_output,
                     'actual': actual,
+                    'passed': (score >= 0.9),
                     'score': score,
                     'error': None
                 })
@@ -58,6 +61,7 @@ def run_code_tests(code_file, test_cases):
                     'input': test_case.input_data,
                     'expected': test_case.expected_output,
                     'actual': 'TIMEOUT',
+                    'passed': False,
                     'score': 0.0,
                     'error': 'Timeout'
                 })
@@ -66,16 +70,18 @@ def run_code_tests(code_file, test_cases):
                     'input': test_case.input_data,
                     'expected': test_case.expected_output,
                     'actual': 'ERROR',
+                    'passed': False,
                     'score': 0.0,
                     'error': str(e)
                 })
     finally:
         os.unlink(temp_path)
+
     return total_score, len(test_cases), results
 
 
 # ============================================================
-# 2. Static analysis helpers (AST)
+# 2. Static analysis (direct file reading)
 # ============================================================
 def get_source_code(code_file):
     with default_storage.open(code_file.name, 'r') as f:
@@ -94,42 +100,33 @@ def analyze_syntax(code_file):
     return 1.0 if get_ast_from_source(source) is not None else 0.0
 
 
-def analyze_function_structure(code_file, assignment):
+def analyze_function_structure(code_file, config):
     source = get_source_code(code_file)
     tree = get_ast_from_source(source)
     if tree is None:
-        return 0.0, 0  # max points 0 if syntax error
-
-    functions = [node for node in ast.walk(tree) if isinstance(node, ast.FunctionDef)]
-    if not functions:
-        return 0.0, 1  # didn't define any function, so max is 1 (if required)
-
-    func = functions[0]
-    # We'll compute score based on config. For now, assume we want points for existence,
-    # name match, param count match. We'll return raw score and max possible.
-    max_possible = 1  # at least existence
-    score = 1.0
-
-    # Get requirements from assignment (prefer grading_config if present)
-    config = assignment.grading_config if hasattr(assignment, 'grading_config') else {}
-    func_req = config.get('function_requirements', {})
-    required = func_req.get('required', True)
-    if not required:
-        # If not required, we give no points for function structure.
         return 0.0, 0
 
-    required_name = func_req.get('name') or assignment.required_function_name
-    required_param = func_req.get('param_count') or assignment.required_param_count
+    functions = [n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef)]
+    if not functions:
+        return 0.0, 1 if config.get('required', False) else 0
 
-    if required_name:
+    func = functions[0]
+    max_possible = 1
+    score = 1.0
+
+    if config.get('name'):
         max_possible += 1
-        if func.name == required_name:
+        if func.name == config['name']:
             score += 1.0
-    if required_param is not None:
+    if config.get('param_count') is not None:
         max_possible += 1
         param_count = len(func.args.args)
-        if param_count == required_param:
+        if param_count == config['param_count']:
             score += 1.0
+
+    if not config.get('required', False):
+        score -= 1.0
+        max_possible -= 1
 
     return score, max_possible
 
@@ -181,115 +178,125 @@ def run_pylint(code_file):
 
 
 # ============================================================
-# 3. Main grading orchestrator with config
+# 3. AI Feedback (Gemini)
 # ============================================================
-def get_grading_config(assignment):
-    """Return full config with defaults merged."""
-    default = {
-        "weights": {
-            "syntax": 10,
-            "function": 15,
-            "return": 5,
-            "tests": 40,
-            "style": 10,
-            "docstring": 10
-        },
-        "function_requirements": {
-            "required": True,
-            "name": None,
-            "param_count": None
-        },
-        "require_return": True,
-        "require_docstring": False,
-        "use_pylint": True,
-        # additional checks can be added later
-    }
-    if assignment.grading_config:
-        # Deep merge (simplistic: override top-level keys, but for nested we'd need more)
-        for key, value in assignment.grading_config.items():
-            if isinstance(value, dict) and key in default and isinstance(default[key], dict):
-                default[key].update(value)
-            else:
-                default[key] = value
-    # Also incorporate old fields for backward compatibility
-    if assignment.required_function_name:
-        default["function_requirements"]["name"] = assignment.required_function_name
-    if assignment.required_param_count is not None:
-        default["function_requirements"]["param_count"] = assignment.required_param_count
-    return default
+def get_ai_feedback(student_code, test_results, assignment_description):
+    api_key = os.environ.get('GEMINI_API_KEY')
+    if not api_key:
+        return None
 
+    client = genai.Client(api_key=api_key)
 
+    test_summary = []
+    for r in test_results:
+        if 'error' in r and r['error']:
+            test_summary.append(f"Error: {r['error']}")
+        else:
+            test_summary.append(
+                f"Test input: {r['input']} expected: {r['expected']} got: {r['actual']} -> {'PASS' if r.get('passed', False) else 'FAIL'}"
+            )
+    test_summary_str = "\n".join(test_summary)
+
+    prompt = f"""
+You are a programming instructor. The assignment description: {assignment_description}
+
+Here is the student's code:
+```
+{student_code}
+```
+
+Test results (each test compares stdout with expected output):
+{test_summary_str}
+
+Give a very short, encouraging, and constructive feedback (max 3 sentences). Focus on what the student did well and one specific thing to improve.
+"""
+    try:
+        response = client.models.generate_content(
+            model='gemini-2.5-flash',
+            contents=prompt
+        )
+        return response.text.strip()
+    except Exception as e:
+        print(f"Gemini API error: {e}")
+        return None
+
+# ============================================================
+# 4. Main grading orchestrator
+# ============================================================
 def grade_submission(code_file, assignment, test_cases):
-    config = get_grading_config(assignment)
-    weights = config.get("weights", {})
-    func_req = config.get("function_requirements", {})
-    require_return = config.get("require_return", True)
-    require_docstring = config.get("require_docstring", False)
-    use_pylint = config.get("use_pylint", True)
+    config = assignment.grading_config if assignment.grading_config else {}
+    
+    default_weights = {
+        'syntax': 10,
+        'function': 15,
+        'return': 5,
+        'tests': 40,
+        'style': 10,
+        'doc': 10,
+    }
+    user_weights = config.get('weights', {})
+    weights = {**default_weights, **user_weights}
+    
+    func_req = config.get('function_requirements', {'required': False})
+    require_return = config.get('require_return', False)
+    require_docstring = config.get('require_docstring', False)
+    use_pylint = config.get('use_pylint', True)
 
-    # We'll compute raw points per category, then sum and normalize to total possible points.
-    # The total possible points = sum of weights (if all checks are performed). But if some
-    # checks are disabled by config (e.g., function not required), we should set their weight to 0.
-    # For simplicity, we'll compute each score out of its weight, but if the check is disabled,
-    # we set both actual and max to 0.
+    total_possible = sum(weights.values())
 
-    # 1. Syntax (always performed)
-    syntax_weight = weights.get("syntax", 0)
-    syntax_score = analyze_syntax(code_file) * syntax_weight if syntax_weight > 0 else 0
+    # 1. Syntax
+    syntax_score = analyze_syntax(code_file) * weights['syntax']
 
     # 2. Function structure
-    func_weight = weights.get("function", 0)
-    if func_req.get("required", True) and func_weight > 0:
-        raw_score, max_possible = analyze_function_structure(code_file, assignment)
-        # raw_score is out of max_possible; we scale to weight
-        func_score = (raw_score / max_possible) * func_weight if max_possible > 0 else 0
+    if weights['function'] > 0:
+        f_score, f_max = analyze_function_structure(code_file, func_req)
+        if f_max > 0:
+            func_score = (f_score / f_max) * weights['function']
+        else:
+            func_score = 0
     else:
         func_score = 0
 
     # 3. Return statement
-    return_weight = weights.get("return", 0)
-    if require_return and return_weight > 0:
-        return_score = analyze_return_statement(code_file) * return_weight
+    if require_return and weights['return'] > 0:
+        return_score = analyze_return_statement(code_file) * weights['return']
     else:
         return_score = 0
 
     # 4. Test cases
-    test_weight = weights.get("tests", 0)
-    if test_weight > 0:
-        test_total_score, test_count, test_results = run_code_tests(code_file, test_cases)
-        test_score = (test_total_score / test_count) * test_weight if test_count > 0 else 0
-    else:
-        test_score = 0
-        test_results = []
+    test_total, test_count, test_results = run_code_tests(code_file, test_cases)
+    test_score = (test_total / test_count) * weights['tests'] if test_count > 0 else 0
 
-    # 5. Style (pylint)
-    style_weight = weights.get("style", 0)
-    if use_pylint and style_weight > 0:
-        style_raw = run_pylint(code_file)  # out of 10
-        style_score = (style_raw / 10) * style_weight
+    # 5. Style
+    if use_pylint and weights['style'] > 0:
+        style_raw = run_pylint(code_file)
+        style_score = (style_raw / 10) * weights['style']
     else:
         style_score = 0
 
-    # 6. Docstring
-    doc_weight = weights.get("docstring", 0)
-    if require_docstring and doc_weight > 0:
-        doc_score = has_docstring(code_file) * doc_weight
+    # 6. Documentation
+    if require_docstring and weights['doc'] > 0:
+        doc_score = has_docstring(code_file) * weights['doc']
     else:
         doc_score = 0
 
-    # Total possible points is sum of all weights that are enabled
-    total_possible = (
-        syntax_weight +
-        (func_weight if func_req.get("required", True) else 0) +
-        (return_weight if require_return else 0) +
-        test_weight +
-        (style_weight if use_pylint else 0) +
-        (doc_weight if require_docstring else 0)
-    )
     total_raw = syntax_score + func_score + return_score + test_score + style_score + doc_score
-
-    # Normalize to 100
     total_grade = (total_raw / total_possible) * 100 if total_possible > 0 else 0
+
+    # Build feedback (non‑AI part)
+    feedback = f"Total grade: {total_grade:.1f}%\n"
+    feedback += f"Syntax: {syntax_score:.1f} / {weights['syntax']}\n"
+    feedback += f"Function structure: {func_score:.1f} / {weights['function']}\n"
+    feedback += f"Return statement: {return_score:.1f} / {weights['return']}\n"
+    feedback += f"Test cases: {test_score:.1f} / {weights['tests']}\n"
+    feedback += f"Code style: {style_score:.1f} / {weights['style']}\n"
+    feedback += f"Documentation: {doc_score:.1f} / {weights['doc']}\n"
+
+    # AI feedback
+    source = get_source_code(code_file)
+    ai_feedback = get_ai_feedback(source, test_results, assignment.description)
+    if ai_feedback:
+        feedback += f"\n\n🤖 AI Suggestion: {ai_feedback}"
 
     breakdown = {
         'syntax': syntax_score,
@@ -302,4 +309,86 @@ def grade_submission(code_file, assignment, test_cases):
         'total_grade': total_grade,
         'test_details': test_results,
     }
-    return total_grade, breakdown
+    return total_grade, breakdown, feedback
+    config = assignment.grading_config if assignment.grading_config else {}
+    weights = config.get('weights', {
+        'syntax': 10,
+        'function': 15,
+        'return': 5,
+        'tests': 40,
+        'style': 10,
+        'doc': 10,
+    })
+    func_req = config.get('function_requirements', {'required': False})
+    require_return = config.get('require_return', False)
+    require_docstring = config.get('require_docstring', False)
+    use_pylint = config.get('use_pylint', True)
+
+    total_possible = sum(weights.values())
+
+    # 1. Syntax
+    syntax_score = analyze_syntax(code_file) * weights['syntax']
+
+    # 2. Function structure
+    if weights['function'] > 0:
+        f_score, f_max = analyze_function_structure(code_file, func_req)
+        if f_max > 0:
+            func_score = (f_score / f_max) * weights['function']
+        else:
+            func_score = 0
+    else:
+        func_score = 0
+
+    # 3. Return statement
+    if require_return and weights['return'] > 0:
+        return_score = analyze_return_statement(code_file) * weights['return']
+    else:
+        return_score = 0
+
+    # 4. Test cases
+    test_total, test_count, test_results = run_code_tests(code_file, test_cases)
+    test_score = (test_total / test_count) * weights['tests'] if test_count > 0 else 0
+
+    # 5. Style
+    if use_pylint and weights['style'] > 0:
+        style_raw = run_pylint(code_file)
+        style_score = (style_raw / 10) * weights['style']
+    else:
+        style_score = 0
+
+    # 6. Documentation
+    if require_docstring and weights['doc'] > 0:
+        doc_score = has_docstring(code_file) * weights['doc']
+    else:
+        doc_score = 0
+
+    total_raw = syntax_score + func_score + return_score + test_score + style_score + doc_score
+    total_grade = (total_raw / total_possible) * 100 if total_possible > 0 else 0
+
+    # Build feedback (non‑AI part)
+    feedback = f"Total grade: {total_grade:.1f}%\n"
+    feedback += f"Syntax: {syntax_score:.1f} / {weights['syntax']}\n"
+    feedback += f"Function structure: {func_score:.1f} / {weights['function']}\n"
+    feedback += f"Return statement: {return_score:.1f} / {weights['return']}\n"
+    feedback += f"Test cases: {test_score:.1f} / {weights['tests']}\n"
+    feedback += f"Code style: {style_score:.1f} / {weights['style']}\n"
+    feedback += f"Documentation: {doc_score:.1f} / {weights['doc']}\n"
+
+    # AI feedback
+    source = get_source_code(code_file)
+    ai_feedback = get_ai_feedback(source, test_results, assignment.description)
+    if ai_feedback:
+        feedback += f"\n\n🤖 AI Suggestion: {ai_feedback}"
+
+    breakdown = {
+        'syntax': syntax_score,
+        'function': func_score,
+        'return': return_score,
+        'tests': test_score,
+        'style': style_score,
+        'doc': doc_score,
+        'total_raw': total_raw,
+        'total_grade': total_grade,
+        'test_details': test_results,
+    }
+    return total_grade, breakdown, feedback
