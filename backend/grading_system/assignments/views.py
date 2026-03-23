@@ -11,6 +11,7 @@ class AssignmentViewSet(viewsets.ModelViewSet):
 
     def perform_create(self, serializer):
         serializer.save(created_by=self.request.user)
+        # Optionally, you could also handle creation of test cases here if included in the request data
 
 
 from rest_framework import viewsets, permissions
