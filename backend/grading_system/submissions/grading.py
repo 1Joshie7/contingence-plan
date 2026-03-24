@@ -187,6 +187,7 @@ def run_pylint(code_file):
 # 3. AI Feedback (Gemini)
 # ============================================================
 def get_ai_feedback(student_code, test_results, assignment_description):
+    """Generate AI feedback with test results (for visible tests)."""
     api_key = os.environ.get('GEMINI_API_KEY')
     if not api_key:
         logger.warning("GEMINI_API_KEY not set, skipping AI feedback")
@@ -211,7 +212,7 @@ You are a programming instructor. The assignment description: {assignment_descri
 Here is the student's code:
 ```
 {student_code}
-``` 
+```
 
 Test results (each test compares stdout with expected output):
 {test_summary_str}
@@ -228,6 +229,70 @@ Give a very short, encouraging, and constructive feedback (max 3 sentences). Foc
         logger.error(f"Gemini API error: {e}")
         return None
 
+
+def get_ai_feedback_generic(student_code, assignment_description):
+    """Generate AI feedback when no visible test cases exist."""
+    api_key = os.environ.get('GEMINI_API_KEY')
+    if not api_key:
+        logger.warning("GEMINI_API_KEY not set, skipping AI feedback")
+        return None
+
+    client = genai.Client(api_key=api_key)
+
+    prompt = f"""
+You are a programming instructor. The assignment description: {assignment_description}
+
+Here is the student's code:
+```
+{student_code}
+```
+
+The assignment uses hidden test cases, so I cannot show you the specific test results. 
+However, please give a short, encouraging, and constructive feedback (max 3 sentences) based only on the code itself. 
+Focus on code structure, style, and logic. Do not mention test cases since they are hidden.
+"""
+    try:
+        response = client.models.generate_content(
+            model='gemini-2.5-flash',
+            contents=prompt
+        )
+        return response.text.strip()
+    except Exception as e:
+        logger.error(f"Gemini API error: {e}")
+        return None
+    
+    # generic feedback when no visible tests exist
+
+def get_ai_feedback_generic(student_code, assignment_description):
+    """Generate AI feedback when no visible test cases exist."""
+    api_key = os.environ.get('GEMINI_API_KEY')
+    if not api_key:
+        logger.warning("GEMINI_API_KEY not set, skipping AI feedback")
+        return None
+
+    client = genai.Client(api_key=api_key)
+
+    prompt = f"""
+You are a programming instructor. The assignment description: {assignment_description}
+
+Here is the student's code:
+```
+{student_code}  
+```
+
+The assignment uses hidden test cases, so I cannot show you the specific test results. 
+However, please give a short, encouraging, and constructive feedback (max 3 sentences) based only on the code itself. 
+Focus on code structure, style, and logic. Do not mention test cases since they are hidden.
+"""
+    try:
+        response = client.models.generate_content(
+            model='gemini-2.5-flash',
+            contents=prompt
+        )
+        return response.text.strip()
+    except Exception as e:
+        logger.error(f"Gemini API error: {e}")
+        return None
 
 # ============================================================
 # 4. Score Calculators
@@ -253,9 +318,10 @@ def compute_return_score(code_file, require_return, weight):
 
 def compute_test_score(code_file, test_cases, weight):
     if weight <= 0 or not test_cases:
-        return 0
+        return 0, []
     test_total, test_count, test_results = run_code_tests(code_file, test_cases)
-    return (test_total / test_count) * weight, test_results
+    score = (test_total / test_count) * weight if test_count > 0 else 0
+    return score, test_results
 
 
 def compute_style_score(code_file, use_pylint, weight):
@@ -277,6 +343,7 @@ def compute_doc_score(code_file, require_docstring, weight):
 def grade_submission(code_file, assignment, test_cases):
     config = assignment.grading_config if assignment.grading_config else {}
     
+    # Default weights
     default_weights = {
         'syntax': 10,
         'function': 15,
@@ -285,42 +352,88 @@ def grade_submission(code_file, assignment, test_cases):
         'style': 10,
         'doc': 10,
     }
-    user_weights = config.get('weights', {})
-    weights = {**default_weights, **user_weights}
     
+    # Merge user weights
+    user_weights = config.get('weights', {})
+    weights = default_weights.copy()
+    for key, value in user_weights.items():
+        if key in weights:
+            weights[key] = value
+        elif key == 'docstring':
+            weights['doc'] = value
+        else:
+            logger.warning(f"Unknown weight key: {key}")
+    
+    # Get flags from config
     func_req = config.get('function_requirements', {'required': False})
     require_return = config.get('require_return', False)
     require_docstring = config.get('require_docstring', False)
     use_pylint = config.get('use_pylint', True)
-
+    
     total_possible = sum(weights.values())
-
-    # Compute each score
+    
+    if total_possible == 0:
+        return 0.0, {}, "No grading rubric configured."
+    
+    # Separate test cases
+    visible_test_cases = [tc for tc in test_cases if not tc.is_hidden]
+    hidden_test_cases = [tc for tc in test_cases if tc.is_hidden]
+    
+    # Determine which test cases to use for grading
+    # If visible tests exist, use them; otherwise use hidden tests
+    grading_test_cases = visible_test_cases if visible_test_cases else hidden_test_cases
+    
+    # Compute scores
     syntax_score = compute_syntax_score(code_file, weights['syntax'])
     func_score = compute_function_score(code_file, func_req, weights['function'])
     return_score = compute_return_score(code_file, require_return, weights['return'])
-    test_score, test_results = compute_test_score(code_file, test_cases, weights['tests'])
+    
+    # Run tests for grading
+    test_score, all_test_results = compute_test_score(code_file, grading_test_cases, weights['tests'])
+    
+    # Run tests for student feedback (only visible tests, weight 0 so they don't affect grade)
+    if visible_test_cases:
+        _, visible_test_results = compute_test_score(code_file, visible_test_cases, 0)
+    else:
+        visible_test_results = []
+    
     style_score = compute_style_score(code_file, use_pylint, weights['style'])
     doc_score = compute_doc_score(code_file, require_docstring, weights['doc'])
-
+    
     total_raw = syntax_score + func_score + return_score + test_score + style_score + doc_score
     total_grade = (total_raw / total_possible) * 100 if total_possible > 0 else 0
-
-    # Build human-readable feedback
+    
+    # Build human-readable feedback (only show categories with weight > 0)
     feedback = f"Total grade: {total_grade:.1f}%\n"
-    feedback += f"Syntax: {syntax_score:.1f} / {weights['syntax']}\n"
-    feedback += f"Function structure: {func_score:.1f} / {weights['function']}\n"
-    feedback += f"Return statement: {return_score:.1f} / {weights['return']}\n"
-    feedback += f"Test cases: {test_score:.1f} / {weights['tests']}\n"
-    feedback += f"Code style: {style_score:.1f} / {weights['style']}\n"
-    feedback += f"Documentation: {doc_score:.1f} / {weights['doc']}\n" "\n"
-
-    # AI feedback
+    
+    if weights['syntax'] > 0:
+        feedback += f"Syntax: {syntax_score:.1f} / {weights['syntax']}\n"
+    if weights['function'] > 0:
+        feedback += f"Function structure: {func_score:.1f} / {weights['function']}\n"
+    if weights['return'] > 0:
+        feedback += f"Return statement: {return_score:.1f} / {weights['return']}\n"
+    if weights['tests'] > 0:
+        feedback += f"Test cases: {test_score:.1f} / {weights['tests']}\n"
+        if not visible_test_cases and hidden_test_cases:
+            feedback += "   (All tests are hidden – only final grade is shown)\n"
+    if weights['style'] > 0:
+        feedback += f"Code style: {style_score:.1f} / {weights['style']}\n"
+    if weights['doc'] > 0:
+        feedback += f"Documentation: {doc_score:.1f} / {weights['doc']}\n"
+    
+    # AI feedback uses ONLY visible test results (if any)
     source = get_source_code(code_file)
-    ai_feedback = get_ai_feedback(source, test_results, assignment.description)
+    if visible_test_results:
+        ai_feedback = get_ai_feedback(source, visible_test_results, assignment.description)
+    elif hidden_test_cases:
+        # No visible tests – provide generic feedback without test details
+        ai_feedback = get_ai_feedback_generic(source, assignment.description)
+    else:
+        ai_feedback = None
+    
     if ai_feedback:
         feedback += f"\n\n🤖 AI Suggestion: {ai_feedback}"
-
+    
     breakdown = {
         'syntax': syntax_score,
         'function': func_score,
@@ -330,6 +443,6 @@ def grade_submission(code_file, assignment, test_cases):
         'doc': doc_score,
         'total_raw': total_raw,
         'total_grade': total_grade,
-        'test_details': test_results,
+        'test_details': visible_test_results,  # Only visible tests shown
     }
     return total_grade, breakdown, feedback

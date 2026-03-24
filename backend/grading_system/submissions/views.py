@@ -20,17 +20,10 @@ class SubmissionViewSet(viewsets.ModelViewSet):
 
     def grade_submission(self, submission):
         assignment = submission.assignment
-        test_cases = TestCase.objects.filter(assignment=assignment)  # include hidden
+        # Use ALL test cases (including hidden) for grading
+        all_test_cases = TestCase.objects.filter(assignment=assignment)
         total_grade, breakdown, feedback = grade_submission(
-        submission.code_file, assignment, test_cases
-        )
-        submission.grade = total_grade
-        submission.feedback = feedback
-        submission.save()
-        assignment = submission.assignment
-        test_cases = TestCase.objects.filter(assignment=assignment, is_hidden=False)
-        total_grade, breakdown, feedback = grade_submission(
-            submission.code_file, assignment, test_cases
+            submission.code_file, assignment, all_test_cases
         )
         submission.grade = total_grade
         submission.feedback = feedback

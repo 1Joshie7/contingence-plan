@@ -1,5 +1,0 @@
-a = int(input())
-b = int(input())
-print("marry")
-print(a + b)
-print("jeremiah")
