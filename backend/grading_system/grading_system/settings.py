@@ -43,6 +43,7 @@ INSTALLED_APPS = [
     'assignments',
     'accounts',
     'submissions',
+    'plagiarism',
 ]
 
 MIDDLEWARE = [

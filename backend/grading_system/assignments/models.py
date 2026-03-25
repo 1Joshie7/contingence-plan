@@ -22,6 +22,7 @@ class Assignment(models.Model):
     
     def __str__(self):
         return self.title
+
 class TestCase(models.Model):
     TEST_TYPE_CHOICES = [
         ('stdout', 'Stdout (run script, compare output)'),

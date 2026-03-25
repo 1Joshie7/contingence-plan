@@ -3,6 +3,7 @@ import tempfile
 import os
 import ast
 import re
+import json
 import logging
 from google import genai
 from django.core.files.storage import default_storage
@@ -30,64 +31,285 @@ def evaluate_test_case(actual_output, expected_output):
     return 0.0
 
 
+# ============================================================
+# 2. Stdout Mode Testing (runs entire script)
+# ============================================================
+def run_stdout_test(student_code_path, test_case):
+    """Run student script and compare stdout with expected output"""
+    try:
+        proc = subprocess.run(
+            ['python', student_code_path],
+            input=test_case.input_data,
+            capture_output=True,
+            text=True,
+            timeout=5
+        )
+        actual = proc.stdout
+        score = evaluate_test_case(actual, test_case.expected_output)
+        return score, {
+            'input': test_case.input_data,
+            'expected': test_case.expected_output,
+            'actual': actual,
+            'passed': (score >= 0.9),
+            'score': score,
+            'error': None
+        }
+    except subprocess.TimeoutExpired:
+        return 0.0, {
+            'input': test_case.input_data,
+            'expected': test_case.expected_output,
+            'actual': 'TIMEOUT',
+            'passed': False,
+            'score': 0.0,
+            'error': 'Timeout'
+        }
+    except Exception as e:
+        return 0.0, {
+            'input': test_case.input_data,
+            'expected': test_case.expected_output,
+            'actual': 'ERROR',
+            'passed': False,
+            'score': 0.0,
+            'error': str(e)
+        }
+
+
+# ============================================================
+# 3. Function Mode Testing (calls specific function)
+# ============================================================
+def generate_function_wrapper(student_code_path, test_case):
+    """Generate a wrapper script that imports student code and calls the function."""
+    code_dir = os.path.dirname(student_code_path)
+    code_filename = os.path.basename(student_code_path)
+    module_name = os.path.splitext(code_filename)[0]
+    function_name = test_case.function_name  # <-- KEY FIX
+    
+    wrapper_content = f'''
+import sys
+import os
+import json
+
+sys.path.insert(0, r"{code_dir}")
+
+try:
+    student_module = __import__('{module_name}')
+except Exception as e:
+    print(f"IMPORT_ERROR: {{e}}")
+    sys.exit(1)
+
+try:
+    func_name = "{function_name}"
+    if not hasattr(student_module, func_name):
+        print(f"FUNCTION_NOT_FOUND: Function '{{func_name}}' not found")
+        sys.exit(1)
+    
+    func = getattr(student_module, func_name)
+    args = {json.dumps(test_case.arguments)}
+    result = func(*args)
+    print(result)
+    
+except Exception as e:
+    print(f"CALL_ERROR: {{e}}")
+    sys.exit(1)
+'''
+    
+    wrapper_fd, wrapper_path = tempfile.mkstemp(suffix='.py', text=True)
+    with os.fdopen(wrapper_fd, 'w') as f:
+        f.write(wrapper_content)
+    
+    return wrapper_path
+
+
+def run_function_test(student_code_path, test_case):
+    """Import student code and call a specific function, compare return value."""
+    wrapper_path = None
+    try:
+        wrapper_path = generate_function_wrapper(student_code_path, test_case)
+        
+        proc = subprocess.run(
+            ['python', wrapper_path],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            cwd=os.path.dirname(student_code_path)
+        )
+        
+        stdout = proc.stdout.strip()
+        stderr = proc.stderr.strip()
+        
+        if proc.returncode != 0:
+            if 'FUNCTION_NOT_FOUND' in stdout or 'FUNCTION_NOT_FOUND' in stderr:
+                error_msg = f"Function '{test_case.function_name}' not found in your code."
+            elif 'IMPORT_ERROR' in stdout or 'IMPORT_ERROR' in stderr:
+                error_msg = "Could not import your code. Check for syntax errors."
+            elif 'CALL_ERROR' in stdout or 'CALL_ERROR' in stderr:
+                error_msg = f"Error calling {test_case.function_name}: {stderr or stdout}"
+            else:
+                error_msg = stderr or stdout or "Unknown error"
+            
+            return 0.0, {
+                'input': f"{test_case.function_name}({test_case.arguments})",
+                'expected': test_case.expected_output,
+                'actual': 'ERROR',
+                'passed': False,
+                'score': 0.0,
+                'error': error_msg
+            }
+        
+        actual = stdout
+        score = evaluate_test_case(actual, test_case.expected_output)
+        
+        return score, {
+            'input': f"{test_case.function_name}({test_case.arguments})",
+            'expected': test_case.expected_output,
+            'actual': actual,
+            'passed': (score >= 0.9),
+            'score': score,
+            'error': None
+        }
+        
+    except subprocess.TimeoutExpired:
+        return 0.0, {
+            'input': f"{test_case.function_name}({test_case.arguments})",
+            'expected': test_case.expected_output,
+            'actual': 'TIMEOUT',
+            'passed': False,
+            'score': 0.0,
+            'error': 'Function execution timed out (possible infinite loop)'
+        }
+    except Exception as e:
+        return 0.0, {
+            'input': f"{test_case.function_name}({test_case.arguments})",
+            'expected': test_case.expected_output,
+            'actual': 'ERROR',
+            'passed': False,
+            'score': 0.0,
+            'error': str(e)
+        }
+    finally:
+        if wrapper_path and os.path.exists(wrapper_path):
+            try:
+                os.unlink(wrapper_path)
+            except:
+                pass
+def run_function_test(student_code_path, test_case):
+    """Import student code and call a specific function, compare return value"""
+    wrapper_path = None
+    try:
+        # Generate wrapper script
+        wrapper_path = generate_function_wrapper(student_code_path, test_case)
+        
+        # Run the wrapper
+        proc = subprocess.run(
+            ['python', wrapper_path],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            cwd=os.path.dirname(student_code_path)
+        )
+        
+        # Get output
+        stdout = proc.stdout.strip()
+        stderr = proc.stderr.strip()
+        
+        # Check for errors
+        if proc.returncode != 0:
+            if 'IMPORT_ERROR' in stdout or 'IMPORT_ERROR' in stderr:
+                error_msg = "Could not import your code. Check for syntax errors."
+            elif 'FUNCTION_NOT_FOUND' in stdout or 'FUNCTION_NOT_FOUND' in stderr:
+                error_msg = f"Function '{test_case.function_name}' not found in your code."
+            elif 'CALL_ERROR' in stdout or 'CALL_ERROR' in stderr:
+                error_msg = f"Error calling {test_case.function_name}: {stderr or stdout}"
+            else:
+                error_msg = stderr or stdout or "Unknown error"
+            
+            return 0.0, {
+                'input': f"{test_case.function_name}({test_case.arguments})",
+                'expected': test_case.expected_output,
+                'actual': 'ERROR',
+                'passed': False,
+                'score': 0.0,
+                'error': error_msg
+            }
+        
+        # Get the actual output
+        actual = stdout
+        score = evaluate_test_case(actual, test_case.expected_output)
+        
+        return score, {
+            'input': f"{test_case.function_name}({test_case.arguments})",
+            'expected': test_case.expected_output,
+            'actual': actual,
+            'passed': (score >= 0.9),
+            'score': score,
+            'error': None
+        }
+        
+    except subprocess.TimeoutExpired:
+        return 0.0, {
+            'input': f"{test_case.function_name}({test_case.arguments})",
+            'expected': test_case.expected_output,
+            'actual': 'TIMEOUT',
+            'passed': False,
+            'score': 0.0,
+            'error': 'Function execution timed out (possible infinite loop)'
+        }
+    except Exception as e:
+        return 0.0, {
+            'input': f"{test_case.function_name}({test_case.arguments})",
+            'expected': test_case.expected_output,
+            'actual': 'ERROR',
+            'passed': False,
+            'score': 0.0,
+            'error': str(e)
+        }
+    finally:
+        if wrapper_path and os.path.exists(wrapper_path):
+            try:
+                os.unlink(wrapper_path)
+            except:
+                pass
+
+
+# ============================================================
+# 4. Main Test Runner
+# ============================================================
 def run_code_tests(code_file, test_cases):
+    """Run all test cases for a submission. Handles both stdout and function test types."""
     total_score = 0.0
     results = []
+    
+    # Write student code to temporary file
     with tempfile.NamedTemporaryFile(mode='w+', suffix='.py', delete=False) as f:
         code_content = default_storage.open(code_file.name).read().decode('utf-8')
         f.write(code_content)
-        temp_path = f.name
-
+        student_code_path = f.name
+    
     try:
         for test_case in test_cases:
-            try:
-                proc = subprocess.run(
-                    ['python', temp_path],
-                    input=test_case.input_data,
-                    capture_output=True,
-                    text=True,
-                    timeout=5
-                )
-                actual = proc.stdout
-                score = evaluate_test_case(actual, test_case.expected_output)
-                total_score += score
-                results.append({
-                    'input': test_case.input_data,
-                    'expected': test_case.expected_output,
-                    'actual': actual,
-                    'passed': (score >= 0.9),
-                    'score': score,
-                    'is_hidden': test_case.is_hidden,
-                    'error': None
-                })
-            except subprocess.TimeoutExpired:
-                results.append({
-                    'input': test_case.input_data,
-                    'expected': test_case.expected_output,
-                    'actual': 'TIMEOUT',
-                    'passed': False,
-                    'score': 0.0,
-                    'is_hidden': test_case.is_hidden,
-                    'error': 'Timeout'
-                })
-            except Exception as e:
-                results.append({
-                    'input': test_case.input_data,
-                    'expected': test_case.expected_output,
-                    'actual': 'ERROR',
-                    'passed': False,
-                    'score': 0.0,
-                    'is_hidden': test_case.is_hidden,
-                    'error': str(e)
-                })
+            test_type = getattr(test_case, 'test_type', 'stdout')
+            
+            if test_type == 'function':
+                score, result = run_function_test(student_code_path, test_case)
+            else:
+                score, result = run_stdout_test(student_code_path, test_case)
+            
+            total_score += score
+            result['is_hidden'] = test_case.is_hidden
+            results.append(result)
+            
     finally:
-        os.unlink(temp_path)
-
+        if os.path.exists(student_code_path):
+            try:
+                os.unlink(student_code_path)
+            except:
+                pass
+    
     return total_score, len(test_cases), results
 
 
 # ============================================================
-# 2. Static analysis (direct file reading)
+# 5. Static analysis (direct file reading)
 # ============================================================
 def get_source_code(code_file):
     with default_storage.open(code_file.name, 'r') as f:
@@ -184,13 +406,11 @@ def run_pylint(code_file):
 
 
 # ============================================================
-# 3. AI Feedback (Gemini)
+# 6. AI Feedback (Gemini)
 # ============================================================
 def get_ai_feedback(student_code, test_results, assignment_description):
-    """Generate AI feedback with test results (for visible tests)."""
     api_key = os.environ.get('GEMINI_API_KEY')
     if not api_key:
-        logger.warning("GEMINI_API_KEY not set, skipping AI feedback")
         return None
 
     client = genai.Client(api_key=api_key)
@@ -214,7 +434,7 @@ Here is the student's code:
 {student_code}
 ```
 
-Test results (each test compares stdout with expected output):
+Test results:
 {test_summary_str}
 
 Give a very short, encouraging, and constructive feedback (max 3 sentences). Focus on what the student did well and one specific thing to improve.
@@ -230,72 +450,8 @@ Give a very short, encouraging, and constructive feedback (max 3 sentences). Foc
         return None
 
 
-def get_ai_feedback_generic(student_code, assignment_description):
-    """Generate AI feedback when no visible test cases exist."""
-    api_key = os.environ.get('GEMINI_API_KEY')
-    if not api_key:
-        logger.warning("GEMINI_API_KEY not set, skipping AI feedback")
-        return None
-
-    client = genai.Client(api_key=api_key)
-
-    prompt = f"""
-You are a programming instructor. The assignment description: {assignment_description}
-
-Here is the student's code:
-```
-{student_code}
-```
-
-The assignment uses hidden test cases, so I cannot show you the specific test results. 
-However, please give a short, encouraging, and constructive feedback (max 3 sentences) based only on the code itself. 
-Focus on code structure, style, and logic. Do not mention test cases since they are hidden.
-"""
-    try:
-        response = client.models.generate_content(
-            model='gemini-2.5-flash',
-            contents=prompt
-        )
-        return response.text.strip()
-    except Exception as e:
-        logger.error(f"Gemini API error: {e}")
-        return None
-    
-    # generic feedback when no visible tests exist
-
-def get_ai_feedback_generic(student_code, assignment_description):
-    """Generate AI feedback when no visible test cases exist."""
-    api_key = os.environ.get('GEMINI_API_KEY')
-    if not api_key:
-        logger.warning("GEMINI_API_KEY not set, skipping AI feedback")
-        return None
-
-    client = genai.Client(api_key=api_key)
-
-    prompt = f"""
-You are a programming instructor. The assignment description: {assignment_description}
-
-Here is the student's code:
-```
-{student_code}  
-```
-
-The assignment uses hidden test cases, so I cannot show you the specific test results. 
-However, please give a short, encouraging, and constructive feedback (max 3 sentences) based only on the code itself. 
-Focus on code structure, style, and logic. Do not mention test cases since they are hidden.
-"""
-    try:
-        response = client.models.generate_content(
-            model='gemini-2.5-flash',
-            contents=prompt
-        )
-        return response.text.strip()
-    except Exception as e:
-        logger.error(f"Gemini API error: {e}")
-        return None
-
 # ============================================================
-# 4. Score Calculators
+# 7. Score Calculators
 # ============================================================
 def compute_syntax_score(code_file, weight):
     return analyze_syntax(code_file) * weight
@@ -318,10 +474,9 @@ def compute_return_score(code_file, require_return, weight):
 
 def compute_test_score(code_file, test_cases, weight):
     if weight <= 0 or not test_cases:
-        return 0, []
+        return 0
     test_total, test_count, test_results = run_code_tests(code_file, test_cases)
-    score = (test_total / test_count) * weight if test_count > 0 else 0
-    return score, test_results
+    return (test_total / test_count) * weight, test_results
 
 
 def compute_style_score(code_file, use_pylint, weight):
@@ -338,12 +493,11 @@ def compute_doc_score(code_file, require_docstring, weight):
 
 
 # ============================================================
-# 5. Main grading orchestrator
+# 8. Main grading orchestrator
 # ============================================================
 def grade_submission(code_file, assignment, test_cases):
     config = assignment.grading_config if assignment.grading_config else {}
     
-    # Default weights
     default_weights = {
         'syntax': 10,
         'function': 15,
@@ -353,7 +507,6 @@ def grade_submission(code_file, assignment, test_cases):
         'doc': 10,
     }
     
-    # Merge user weights
     user_weights = config.get('weights', {})
     weights = default_weights.copy()
     for key, value in user_weights.items():
@@ -361,10 +514,7 @@ def grade_submission(code_file, assignment, test_cases):
             weights[key] = value
         elif key == 'docstring':
             weights['doc'] = value
-        else:
-            logger.warning(f"Unknown weight key: {key}")
     
-    # Get flags from config
     func_req = config.get('function_requirements', {'required': False})
     require_return = config.get('require_return', False)
     require_docstring = config.get('require_docstring', False)
@@ -375,35 +525,16 @@ def grade_submission(code_file, assignment, test_cases):
     if total_possible == 0:
         return 0.0, {}, "No grading rubric configured."
     
-    # Separate test cases
-    visible_test_cases = [tc for tc in test_cases if not tc.is_hidden]
-    hidden_test_cases = [tc for tc in test_cases if tc.is_hidden]
-    
-    # Determine which test cases to use for grading
-    # If visible tests exist, use them; otherwise use hidden tests
-    grading_test_cases = visible_test_cases if visible_test_cases else hidden_test_cases
-    
-    # Compute scores
     syntax_score = compute_syntax_score(code_file, weights['syntax'])
     func_score = compute_function_score(code_file, func_req, weights['function'])
     return_score = compute_return_score(code_file, require_return, weights['return'])
-    
-    # Run tests for grading
-    test_score, all_test_results = compute_test_score(code_file, grading_test_cases, weights['tests'])
-    
-    # Run tests for student feedback (only visible tests, weight 0 so they don't affect grade)
-    if visible_test_cases:
-        _, visible_test_results = compute_test_score(code_file, visible_test_cases, 0)
-    else:
-        visible_test_results = []
-    
+    test_score, test_results = compute_test_score(code_file, test_cases, weights['tests'])
     style_score = compute_style_score(code_file, use_pylint, weights['style'])
     doc_score = compute_doc_score(code_file, require_docstring, weights['doc'])
     
     total_raw = syntax_score + func_score + return_score + test_score + style_score + doc_score
     total_grade = (total_raw / total_possible) * 100 if total_possible > 0 else 0
     
-    # Build human-readable feedback (only show categories with weight > 0)
     feedback = f"Total grade: {total_grade:.1f}%\n"
     
     if weights['syntax'] > 0:
@@ -414,23 +545,13 @@ def grade_submission(code_file, assignment, test_cases):
         feedback += f"Return statement: {return_score:.1f} / {weights['return']}\n"
     if weights['tests'] > 0:
         feedback += f"Test cases: {test_score:.1f} / {weights['tests']}\n"
-        if not visible_test_cases and hidden_test_cases:
-            feedback += "   (All tests are hidden – only final grade is shown)\n"
     if weights['style'] > 0:
         feedback += f"Code style: {style_score:.1f} / {weights['style']}\n"
     if weights['doc'] > 0:
         feedback += f"Documentation: {doc_score:.1f} / {weights['doc']}\n"
     
-    # AI feedback uses ONLY visible test results (if any)
     source = get_source_code(code_file)
-    if visible_test_results:
-        ai_feedback = get_ai_feedback(source, visible_test_results, assignment.description)
-    elif hidden_test_cases:
-        # No visible tests – provide generic feedback without test details
-        ai_feedback = get_ai_feedback_generic(source, assignment.description)
-    else:
-        ai_feedback = None
-    
+    ai_feedback = get_ai_feedback(source, test_results, assignment.description)
     if ai_feedback:
         feedback += f"\n\n🤖 AI Suggestion: {ai_feedback}"
     
@@ -443,6 +564,6 @@ def grade_submission(code_file, assignment, test_cases):
         'doc': doc_score,
         'total_raw': total_raw,
         'total_grade': total_grade,
-        'test_details': visible_test_results,  # Only visible tests shown
+        'test_details': test_results,
     }
     return total_grade, breakdown, feedback

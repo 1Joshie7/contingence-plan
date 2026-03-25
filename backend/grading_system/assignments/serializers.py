@@ -5,6 +5,7 @@ from django.contrib.auth import get_user_model
 
 User = get_user_model()
 
+
 # ============================================================
 # Course Serializer
 # ============================================================
@@ -34,9 +35,9 @@ class TestCaseSerializer(serializers.ModelSerializer):
             'is_hidden', 'function_name', 'arguments'
         ]
         extra_kwargs = {
-            'input_data': {'required': False},
-            'expected_output': {'required': False},
-            'function_name': {'required': False},
+            'input_data': {'required': False, 'allow_blank': True},
+            'expected_output': {'required': False, 'allow_blank': True},
+            'function_name': {'required': False, 'allow_blank': True},
             'arguments': {'required': False},
         }
 

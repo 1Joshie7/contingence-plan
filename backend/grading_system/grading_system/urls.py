@@ -8,7 +8,7 @@ urlpatterns = [
     path('api/auth/', include('accounts.urls')),
     path('api/', include('assignments.urls')),
     path('api/', include('submissions.urls')),
-   
+    path('api/', include('plagiarism.urls')),
     
 
 

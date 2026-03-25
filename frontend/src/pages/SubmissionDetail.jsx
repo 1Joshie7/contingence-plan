@@ -28,6 +28,11 @@ export default function SubmissionDetail() {
   if (error) return <div className="text-center py-10 text-red-500">{error}</div>;
   if (!submission) return <div className="text-center py-10">Submission not found</div>;
 
+  const student = submission.student || {};
+  const fullName = student.first_name || student.last_name
+    ? `${student.first_name || ''} ${student.last_name || ''}`.trim()
+    : student.username || 'Unknown Student';
+
   return (
     <div className="min-h-screen bg-gray-50">
       <nav className="bg-white shadow-sm">
@@ -39,11 +44,12 @@ export default function SubmissionDetail() {
 
       <main className="max-w-4xl mx-auto px-4 py-8">
         <motion.div initial={{ opacity: 0, y: 20 }} animate={{ opacity: 1, y: 0 }}>
-<h1 className="text-2xl font-bold text-gray-800 mb-2">
-  Submission by {submission.student?.first_name} {submission.student?.last_name}
-</h1>
-<p className="text-sm text-gray-500 mb-1">Registration: {submission.student?.reg_number}</p>
-<p className="text-sm text-gray-500 mb-6">Submitted: {new Date(submission.submitted_at).toLocaleString()}</p>
+          <h1 className="text-2xl font-bold text-gray-800 mb-2">
+            Submission by {fullName}
+          </h1>
+          {student.reg_number && (
+            <p className="text-sm text-gray-500 mb-1">Registration: {student.reg_number}</p>
+          )}
           <p className="text-sm text-gray-500 mb-6">Submitted: {new Date(submission.submitted_at).toLocaleString()}</p>
 
           <div className="bg-white rounded-lg shadow p-6 mb-6">
