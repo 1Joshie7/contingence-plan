@@ -2,6 +2,7 @@
 from dotenv import load_dotenv
 load_dotenv()
 from pathlib import Path
+import os
 
 # Build paths inside the project like this: BASE_DIR / 'subdir'.
 BASE_DIR = Path(__file__).resolve().parent.parent
@@ -16,10 +17,10 @@ SECRET_KEY = 'django-insecure-70dthug8uw_fv@b523ach6m_c)xaisc-*2la=f2kj1@6jrn=70
 # SECURITY WARNING: don't run with debug turned on in production!
 DEBUG = True
 
-CORS_ALLOWED_ORIGINS = [
-    "http://localhost:3000",
-    "http://127.0.0.1:3000",
-]
+
+#allowed host 
+#For production deployment
+CORS_ALLOWED_ORIGINS = os.environ.get('CORS_ALLOWED_ORIGINS', 'http://localhost:3000').split(',')
 
 ALLOWED_HOSTS = []
 
