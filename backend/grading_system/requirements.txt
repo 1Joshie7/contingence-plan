@@ -4,6 +4,7 @@ djangorestframework==3.17.0
 djangorestframework-simplejwt==5.5.1
 pylint==4.0.5
 google-generativeai==0.8.6
+google-genai==1.68.0
 python-dotenv==1.2.2
 waitress
 setuptools
