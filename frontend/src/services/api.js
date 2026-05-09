@@ -1,6 +1,6 @@
 import axios from 'axios';
 
-const API_BASE_URL = 'http://127.0.0.1:8000/api'; // change for production
+const API_BASE_URL = 'https://programming-assignment-grading-and.onrender.com/admin'; // change for production
 
 const api = axios.create({
   baseURL: API_BASE_URL,
